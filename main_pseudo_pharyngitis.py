@@ -1,529 +1,565 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
-"""
-Pseudo-label training script for pharyngitis image classification/regression.
-
-This script supports:
-1. Supervised training on labeled pediatric/adult data
-2. Teacher-model inference for pseudo-label generation
-3. Confidence filtering of pseudo-labeled samples
-4. Student training using real + pseudo-labeled data
-
-Expected CSV columns:
-- image_path: path to image file
-- bacterial_ratio: target value between 0 and 1 for labeled data
-
-Optional columns:
-- patient_ID
-- age
-- group
-"""
+# main.py
 
 import os
 import random
 import argparse
-from collections import OrderedDict
-from typing import Optional, Tuple, List
-
 import numpy as np
 import pandas as pd
 from PIL import Image
 
+import cv2
+import matplotlib.pyplot as plt
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-
-import timm
+from torchvision import transforms, models
 
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import mean_absolute_error, mean_squared_error, roc_auc_score
 
 
-# ============================================================
-# Utility
-# ============================================================
-def seed_everything(seed: int = 42) -> None:
+# =========================
+# Seed
+# =========================
+def seed_everything(seed=42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
 
-def get_device() -> str:
-    return "cuda" if torch.cuda.is_available() else "cpu"
-
-
-# ============================================================
+# =========================
 # Dataset
-# ============================================================
-class PharyngitisDataset(Dataset):
-    def __init__(
-        self,
-        df: pd.DataFrame,
-        transform=None,
-        target_col: Optional[str] = "bacterial_ratio",
-        return_target: bool = True,
-    ):
+# =========================
+class PharyngitisFusionDataset(Dataset):
+    def __init__(self, df, tabular_cols, transform=None):
         self.df = df.reset_index(drop=True)
+        self.tabular_cols = tabular_cols
         self.transform = transform
-        self.target_col = target_col
-        self.return_target = return_target
 
     def __len__(self):
         return len(self.df)
 
-    def __getitem__(self, idx: int):
+    def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        img = Image.open(row["image_path"]).convert("RGB")
 
+        img = Image.open(row["image_path"]).convert("RGB")
         if self.transform:
             img = self.transform(img)
 
-        if self.return_target:
-            y = torch.tensor(row[self.target_col], dtype=torch.float32)
-            return img, y
-
-        return img
-
-
-# ============================================================
-# Transform
-# ============================================================
-class TransformFactory:
-    def __init__(self, img_size: int = 224):
-        self.img_size = img_size
-
-    def train(self):
-        return transforms.Compose([
-            transforms.Resize((self.img_size, self.img_size)),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomRotation(10),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std =[0.229, 0.224, 0.225],
-            ),
-        ])
-
-    def valid(self):
-        return transforms.Compose([
-            transforms.Resize((self.img_size, self.img_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std =[0.229, 0.224, 0.225],
-            ),
-        ])
-
-
-# ============================================================
-# Model
-# ============================================================
-class PharyngitisRegressor(nn.Module):
-    def __init__(self, model_name: str = "resnet10t", pretrained: bool = True):
-        super().__init__()
-        self.model = timm.create_model(
-            model_name,
-            pretrained=pretrained,
-            num_classes=1,
+        x_tab = torch.tensor(
+            row[self.tabular_cols].astype(float).values,
+            dtype=torch.float32
         )
-
-    def forward(self, x):
-        x = self.model(x)
-        x = torch.sigmoid(x)
-        return x.squeeze(1)
-
-
-# ============================================================
-# Trainer
-# ============================================================
-class Trainer:
-    def __init__(
-        self,
-        model: nn.Module,
-        device: str,
-        lr: float = 1e-4,
-        pseudo_weight: float = 0.3,
-    ):
-        self.model = model.to(device)
-        self.device = device
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
-        self.criterion = nn.MSELoss(reduction="none")
-        self.pseudo_weight = pseudo_weight
-
-    def train_one_epoch(self, loader: DataLoader) -> float:
-        self.model.train()
-        total_loss = 0.0
-        total_n = 0
-
-        for batch in loader:
-            if len(batch) == 3:
-                imgs, targets, is_pseudo = batch
-                is_pseudo = is_pseudo.to(self.device).float()
-            else:
-                imgs, targets = batch
-                is_pseudo = torch.zeros_like(targets)
-
-            imgs = imgs.to(self.device)
-            targets = targets.to(self.device)
-            is_pseudo = is_pseudo.to(self.device)
-
-            preds = self.model(imgs)
-            loss_each = self.criterion(preds, targets)
-
-            weights = torch.where(
-                is_pseudo > 0,
-                torch.full_like(loss_each, self.pseudo_weight),
-                torch.ones_like(loss_each),
-            )
-
-            loss = (loss_each * weights).mean()
-
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-
-            total_loss += loss.item() * imgs.size(0)
-            total_n += imgs.size(0)
-
-        return total_loss / total_n
-
-    @torch.no_grad()
-    def predict(self, loader: DataLoader) -> Tuple[float, np.ndarray, np.ndarray]:
-        self.model.eval()
-        total_loss = 0.0
-        total_n = 0
-        all_targets = []
-        all_preds = []
-
-        for imgs, targets in loader:
-            imgs = imgs.to(self.device)
-            targets = targets.to(self.device)
-
-            preds = self.model(imgs)
-            loss_each = self.criterion(preds, targets)
-            loss = loss_each.mean()
-
-            total_loss += loss.item() * imgs.size(0)
-            total_n += imgs.size(0)
-
-            all_targets.extend(targets.detach().cpu().numpy())
-            all_preds.extend(preds.detach().cpu().numpy())
-
-        return total_loss / total_n, np.array(all_targets), np.array(all_preds)
-
-
-class PseudoAwareDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, transform=None):
-        self.df = df.reset_index(drop=True)
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx: int):
-        row = self.df.iloc[idx]
-        img = Image.open(row["image_path"]).convert("RGB")
-
-        if self.transform:
-            img = self.transform(img)
 
         y = torch.tensor(row["bacterial_ratio"], dtype=torch.float32)
-        is_pseudo = torch.tensor(row.get("is_pseudo", 0), dtype=torch.float32)
 
-        return img, y, is_pseudo
+        return img, x_tab, y
 
 
-# ============================================================
-# Pseudo Labeler
-# ============================================================
-class PseudoLabeler:
-    def __init__(
-        self,
-        model: nn.Module,
-        device: str,
-        transform,
-        batch_size: int = 16,
-        num_workers: int = 2,
-    ):
-        self.model = model.to(device)
+# =========================
+# Model
+# =========================
+class ResNet18FusionRegressor(nn.Module):
+    def __init__(self, n_tab, pretrained=True):
+        super().__init__()
+
+        base = models.resnet18(
+            weights=models.ResNet18_Weights.DEFAULT if pretrained else None
+        )
+
+        in_features = base.fc.in_features
+        base.fc = nn.Identity()
+
+        self.backbone = base
+
+        self.tab = nn.Sequential(
+            nn.Linear(n_tab, 32),
+            nn.ReLU(),
+            nn.Dropout(0.2)
+        )
+
+        self.head = nn.Sequential(
+            nn.Linear(in_features + 32, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 1)
+        )
+
+    def forward(self, img, x_tab):
+        img_feat = self.backbone(img)
+        tab_feat = self.tab(x_tab)
+
+        x = torch.cat([img_feat, tab_feat], dim=1)
+        x = self.head(x)
+
+        return torch.sigmoid(x).squeeze(1)
+
+
+# =========================
+# Train / Valid
+# =========================
+def train_one_epoch(model, loader, optimizer, criterion, device):
+    model.train()
+    total_loss = 0.0
+
+    for imgs, x_tab, targets in loader:
+        imgs = imgs.to(device)
+        x_tab = x_tab.to(device)
+        targets = targets.to(device)
+
+        optimizer.zero_grad()
+        preds = model(imgs, x_tab)
+        loss = criterion(preds, targets)
+
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item() * imgs.size(0)
+
+    return total_loss / len(loader.dataset)
+
+
+@torch.no_grad()
+def predict_valid(model, loader, criterion, device):
+    model.eval()
+    total_loss = 0.0
+
+    all_targets = []
+    all_preds = []
+
+    for imgs, x_tab, targets in loader:
+        imgs = imgs.to(device)
+        x_tab = x_tab.to(device)
+        targets = targets.to(device)
+
+        preds = model(imgs, x_tab)
+        loss = criterion(preds, targets)
+
+        total_loss += loss.item() * imgs.size(0)
+
+        all_targets.extend(targets.cpu().numpy())
+        all_preds.extend(preds.cpu().numpy())
+
+    return (
+        total_loss / len(loader.dataset),
+        np.array(all_targets),
+        np.array(all_preds)
+    )
+
+
+# =========================
+# Grad-CAM++
+# =========================
+class GradCAMPlusPlusFusion:
+    def __init__(self, model, target_layer, device):
+        self.model = model
+        self.target_layer = target_layer
         self.device = device
-        self.transform = transform
-        self.batch_size = batch_size
-        self.num_workers = num_workers
 
-    @torch.no_grad()
-    def predict(self, df: pd.DataFrame) -> np.ndarray:
-        ds = PharyngitisDataset(
-            df,
-            transform=self.transform,
-            target_col=None,
-            return_target=False,
-        )
-        loader = DataLoader(
-            ds,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-        )
+        self.activations = None
+        self.gradients = None
 
-        self.model.eval()
-        preds = []
+        self.fwd_handle = target_layer.register_forward_hook(self._forward_hook)
+        self.bwd_handle = target_layer.register_full_backward_hook(self._backward_hook)
 
-        for imgs in loader:
-            imgs = imgs.to(self.device)
-            p = self.model(imgs)
-            preds.extend(p.detach().cpu().numpy())
+    def _forward_hook(self, module, inp, out):
+        self.activations = out
 
-        return np.array(preds)
+    def _backward_hook(self, module, grad_in, grad_out):
+        self.gradients = grad_out[0]
 
-    def create_pseudo_dataframe(
-        self,
-        unlabeled_df: pd.DataFrame,
-        low_th: float = 0.10,
-        high_th: float = 0.90,
-    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        pseudo_df = unlabeled_df.copy()
-        pseudo_df = pseudo_df[pseudo_df["image_path"].notna()].reset_index(drop=True)
+    def remove_hooks(self):
+        self.fwd_handle.remove()
+        self.bwd_handle.remove()
 
-        preds = self.predict(pseudo_df)
+    def generate(self, imgs, x_tab):
+        self.model.zero_grad()
 
-        pseudo_df["pseudo_bacterial_ratio"] = preds
-        pseudo_df["pseudo_label_binary"] = (preds >= 0.5).astype(int)
+        preds = self.model(imgs, x_tab)
+        score = preds.sum()
+        score.backward(retain_graph=True)
 
-        pseudo_df["pseudo_confident"] = (
-            (pseudo_df["pseudo_bacterial_ratio"] <= low_th) |
-            (pseudo_df["pseudo_bacterial_ratio"] >= high_th)
-        )
+        grads = self.gradients
+        acts = self.activations
 
-        pseudo_keep = pseudo_df[pseudo_df["pseudo_confident"]].copy()
-        pseudo_keep["bacterial_ratio"] = pseudo_keep["pseudo_bacterial_ratio"]
-        pseudo_keep["stratify_label"] = (pseudo_keep["bacterial_ratio"] >= 0.5).astype(int)
-        pseudo_keep["is_pseudo"] = 1
+        grads2 = grads ** 2
+        grads3 = grads2 * grads
 
-        return pseudo_df, pseudo_keep.reset_index(drop=True)
+        sum_acts = acts.sum(dim=(2, 3), keepdim=True)
+        alpha = grads2 / (2 * grads2 + sum_acts * grads3 + 1e-8)
+
+        weights = (alpha * F.relu(grads)).sum(dim=(2, 3), keepdim=True)
+
+        cam = (weights * acts).sum(dim=1)
+        cam = F.relu(cam)
+
+        cam = F.interpolate(
+            cam.unsqueeze(1),
+            size=imgs.shape[-2:],
+            mode="bilinear",
+            align_corners=False
+        ).squeeze(1)
+
+        cam_min = cam.flatten(1).min(dim=1)[0].view(-1, 1, 1)
+        cam_max = cam.flatten(1).max(dim=1)[0].view(-1, 1, 1)
+        cam = (cam - cam_min) / (cam_max - cam_min + 1e-8)
+
+        return cam.detach().cpu(), preds.detach().cpu()
 
 
-# ============================================================
-# Cross-validation
-# ============================================================
-class CrossValidator:
-    def __init__(
-        self,
-        model_name: str,
-        img_size: int,
-        batch_size: int,
-        epochs: int,
-        lr: float,
-        n_splits: int,
-        device: str,
-        output_dir: str,
-        pseudo_weight: float = 0.3,
-        num_workers: int = 2,
+def contrast_stretch(img, low=2, high=98):
+    lo = np.percentile(img, low)
+    hi = np.percentile(img, high)
+    return np.clip((img - lo) / (hi - lo + 1e-6), 0, 1)
+
+
+def overlay_cam(img, cam, alpha=0.35):
+    if torch.is_tensor(img):
+        img = img.detach().cpu().numpy()
+
+    if img.ndim == 3 and img.shape[0] == 3:
+        img = np.transpose(img, (1, 2, 0))
+
+    img = np.clip(img, 0, 1)
+
+    cam = cv2.resize(cam, (img.shape[1], img.shape[0]))
+    cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-6)
+
+    heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
+    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB) / 255.0
+
+    overlay = (1 - alpha) * img + alpha * heatmap
+    return np.clip(overlay, 0, 1)
+
+
+def make_mean_cam_figure(
+    model,
+    loader,
+    device,
+    out_path,
+    prob_low=0.1,
+    prob_high=0.9,
+    alpha=0.35
+):
+    model.eval()
+
+    target_layer = model.backbone.layer4[-1].conv2
+    cam_analyzer = GradCAMPlusPlusFusion(model, target_layer, device)
+
+    imgs_all = []
+    cams_all = []
+
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+    for imgs, x_tab, targets in loader:
+        imgs = imgs.to(device)
+        x_tab = x_tab.to(device)
+
+        with torch.no_grad():
+            probs = model(imgs, x_tab)
+
+        mask = (probs < prob_low) | (probs > prob_high)
+
+        if mask.sum().item() == 0:
+            continue
+
+        imgs_f = imgs[mask]
+        x_tab_f = x_tab[mask]
+
+        cams, probs_f = cam_analyzer.generate(imgs_f, x_tab_f)
+
+        imgs_all.append(imgs_f.detach().cpu())
+        cams_all.append(cams.detach().cpu())
+
+    cam_analyzer.remove_hooks()
+
+    if len(imgs_all) == 0:
+        print("No samples passed confidence filter.")
+        return
+
+    imgs_all = torch.cat(imgs_all, dim=0)
+    cams_all = torch.cat(cams_all, dim=0)
+
+    print("Grad-CAM N used:", len(imgs_all))
+
+    # median image
+    mean_img = imgs_all.median(dim=0).values
+    mean_img = mean_img * std + mean
+    mean_img = mean_img.clamp(0, 1)
+
+    img_np = mean_img.numpy().transpose(1, 2, 0)
+    img_np = contrast_stretch(img_np, low=2, high=98)
+
+    mean_cam = cams_all.mean(dim=0).numpy()
+    mean_cam = (mean_cam - mean_cam.min()) / (mean_cam.max() - mean_cam.min() + 1e-6)
+
+    overlay = overlay_cam(img_np, mean_cam, alpha=alpha)
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+    axes[0].imshow(img_np)
+    axes[0].set_title("Median image")
+    axes[0].axis("off")
+
+    axes[1].imshow(mean_cam, cmap="jet")
+    axes[1].set_title("Mean activation Grad-CAM++")
+    axes[1].axis("off")
+
+    axes[2].imshow(overlay)
+    axes[2].set_title("Overlay")
+    axes[2].axis("off")
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300)
+    plt.close()
+
+    print("Saved:", out_path)
+
+
+# =========================
+# Main
+# =========================
+def main(args):
+    seed_everything(args.seed)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    tab_cols = args.tab_cols.split(",")
+
+    train_tfms = transforms.Compose([
+        transforms.Resize((args.img_size, args.img_size)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomRotation(10),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        ),
+    ])
+
+    valid_tfms = transforms.Compose([
+        transforms.Resize((args.img_size, args.img_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        ),
+    ])
+
+    df = pd.read_csv(args.csv_path)
+
+    # sex preprocessing
+    if "Sex" in df.columns:
+        df["Sex"] = df["Sex"].replace({
+            "Male": 0,
+            "Female": 1,
+            "M": 0,
+            "F": 1,
+            "male": 0,
+            "female": 1
+        })
+
+    df[tab_cols] = df[tab_cols].apply(pd.to_numeric, errors="coerce")
+    df[tab_cols] = df[tab_cols].fillna(0)
+
+    real_df = df[df["is_pseudo"] == 0].reset_index(drop=True)
+    pseudo_df = df[df["is_pseudo"] == 1].reset_index(drop=True)
+
+    print("real:", len(real_df))
+    print("pseudo:", len(pseudo_df))
+    print("real label:")
+    print(real_df["stratify_label"].value_counts())
+
+    skf = StratifiedKFold(
+        n_splits=args.n_splits,
+        shuffle=True,
+        random_state=args.seed
+    )
+
+    oof_pred = np.zeros(len(real_df), dtype=np.float32)
+    fold_results = []
+
+    for fold, (tr_idx, va_idx) in enumerate(
+        skf.split(np.zeros(len(real_df)), real_df["stratify_label"]),
+        1
     ):
-        self.model_name = model_name
-        self.img_size = img_size
-        self.batch_size = batch_size
-        self.epochs = epochs
-        self.lr = lr
-        self.n_splits = n_splits
-        self.device = device
-        self.output_dir = output_dir
-        self.pseudo_weight = pseudo_weight
-        self.num_workers = num_workers
+        print("\n" + "=" * 80)
+        print(f"FOLD {fold}")
+        print("=" * 80)
 
-        os.makedirs(self.output_dir, exist_ok=True)
-        self.tfms = TransformFactory(img_size)
+        real_train_df = real_df.iloc[tr_idx].reset_index(drop=True)
+        valid_df = real_df.iloc[va_idx].reset_index(drop=True)
 
-    def run(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-        df = df[df["image_path"].notna()].reset_index(drop=True)
+        if args.use_pseudo:
+            train_df = pd.concat(
+                [real_train_df, pseudo_df],
+                axis=0
+            ).reset_index(drop=True)
+        else:
+            train_df = real_train_df.copy()
 
-        if "stratify_label" not in df.columns:
-            df["stratify_label"] = (df["bacterial_ratio"] >= 0.5).astype(int)
+        print("train real:", len(real_train_df))
+        print("train pseudo:", len(pseudo_df) if args.use_pseudo else 0)
+        print("valid real:", len(valid_df))
+        print("train label:")
+        print(train_df["stratify_label"].value_counts())
+        print("valid label:")
+        print(valid_df["stratify_label"].value_counts())
 
-        if "is_pseudo" not in df.columns:
-            df["is_pseudo"] = 0
+        train_ds = PharyngitisFusionDataset(
+            train_df,
+            tabular_cols=tab_cols,
+            transform=train_tfms
+        )
 
-        skf = StratifiedKFold(
-            n_splits=self.n_splits,
+        valid_ds = PharyngitisFusionDataset(
+            valid_df,
+            tabular_cols=tab_cols,
+            transform=valid_tfms
+        )
+
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
             shuffle=True,
-            random_state=42,
+            num_workers=args.num_workers,
+            pin_memory=True
         )
 
-        X_dummy = np.zeros(len(df))
-        y_strat = df["stratify_label"].values
+        valid_loader = DataLoader(
+            valid_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True
+        )
 
-        oof_pred = np.zeros(len(df), dtype=np.float32)
-        fold_results = []
+        model = ResNet18FusionRegressor(
+            n_tab=len(tab_cols),
+            pretrained=True
+        ).to(device)
 
-        for fold, (tr_idx, va_idx) in enumerate(skf.split(X_dummy, y_strat), 1):
-            print("\n" + "=" * 80)
-            print(f"FOLD {fold}")
-            print("=" * 80)
+        criterion = nn.MSELoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-            train_df = df.iloc[tr_idx].reset_index(drop=True)
-            valid_df = df.iloc[va_idx].reset_index(drop=True)
+        best_mae = np.inf
+        best_state = None
 
-            print("train:", len(train_df), "valid:", len(valid_df))
-            print("pseudo in train:", int(train_df["is_pseudo"].sum()))
-
-            train_ds = PseudoAwareDataset(train_df, transform=self.tfms.train())
-            valid_ds = PharyngitisDataset(valid_df, transform=self.tfms.valid())
-
-            train_loader = DataLoader(
-                train_ds,
-                batch_size=self.batch_size,
-                shuffle=True,
-                num_workers=self.num_workers,
-            )
-            valid_loader = DataLoader(
-                valid_ds,
-                batch_size=self.batch_size,
-                shuffle=False,
-                num_workers=self.num_workers,
+        for epoch in range(args.epochs):
+            train_loss = train_one_epoch(
+                model,
+                train_loader,
+                optimizer,
+                criterion,
+                device
             )
 
-            model = PharyngitisRegressor(
-                model_name=self.model_name,
-                pretrained=True,
+            valid_loss, y_true, y_pred = predict_valid(
+                model,
+                valid_loader,
+                criterion,
+                device
             )
 
-            trainer = Trainer(
-                model=model,
-                device=self.device,
-                lr=self.lr,
-                pseudo_weight=self.pseudo_weight,
-            )
-
-            best_mae = np.inf
-            best_state = None
-
-            for epoch in range(self.epochs):
-                train_loss = trainer.train_one_epoch(train_loader)
-                valid_loss, y_true, y_pred = trainer.predict(valid_loader)
-
-                mae = mean_absolute_error(y_true, y_pred)
-                rmse = mean_squared_error(y_true, y_pred) ** 0.5
-
-                y_true_bin = (y_true >= 0.5).astype(int)
-                try:
-                    auc = roc_auc_score(y_true_bin, y_pred)
-                except Exception:
-                    auc = np.nan
-
-                print(
-                    f"fold={fold} epoch={epoch+1:02d}/{self.epochs} "
-                    f"train_loss={train_loss:.4f} valid_loss={valid_loss:.4f} "
-                    f"mae={mae:.4f} rmse={rmse:.4f} auc={auc:.4f}"
-                )
-
-                if mae < best_mae:
-                    best_mae = mae
-                    best_state = {
-                        k: v.detach().cpu().clone()
-                        for k, v in trainer.model.state_dict().items()
-                    }
-
-            model_path = os.path.join(self.output_dir, f"best_model_fold{fold}.pth")
-            torch.save(best_state, model_path)
-
-            trainer.model.load_state_dict(best_state)
-            valid_loss, y_true, y_pred = trainer.predict(valid_loader)
-
-            oof_pred[va_idx] = y_pred
-
-            fold_mae = mean_absolute_error(y_true, y_pred)
-            fold_rmse = mean_squared_error(y_true, y_pred) ** 0.5
+            mae = mean_absolute_error(y_true, y_pred)
+            rmse = mean_squared_error(y_true, y_pred) ** 0.5
 
             y_true_bin = (y_true >= 0.5).astype(int)
             try:
-                fold_auc = roc_auc_score(y_true_bin, y_pred)
+                auc = roc_auc_score(y_true_bin, y_pred)
             except Exception:
-                fold_auc = np.nan
+                auc = np.nan
 
-            fold_results.append({
-                "fold": fold,
-                "n_train": len(train_df),
-                "n_valid": len(valid_df),
-                "n_pseudo_train": int(train_df["is_pseudo"].sum()),
-                "mae": fold_mae,
-                "rmse": fold_rmse,
-                "auc_binary_ref": fold_auc,
-            })
-
-        result_df = pd.DataFrame(fold_results)
-        result_df.to_csv(os.path.join(self.output_dir, "cv_results.csv"), index=False)
-
-        df["oof_pred_ratio"] = oof_pred
-        df.to_csv(os.path.join(self.output_dir, "oof_predictions.csv"), index=False)
-
-        self.average_fold_weights()
-
-        print("\n=== CV summary ===")
-        print(result_df[["mae", "rmse", "auc_binary_ref"]].agg(["mean", "std"]))
-
-        y_true_all = df["bacterial_ratio"].values
-        y_pred_all = oof_pred
-
-        print("\n=== OOF overall ===")
-        print("OOF MAE :", mean_absolute_error(y_true_all, y_pred_all))
-        print("OOF RMSE:", mean_squared_error(y_true_all, y_pred_all) ** 0.5)
-
-        try:
             print(
-                "OOF AUC(binary ref):",
-                roc_auc_score((y_true_all >= 0.5).astype(int), y_pred_all),
+                f"fold={fold} epoch={epoch+1:02d}/{args.epochs} "
+                f"train_loss={train_loss:.4f} "
+                f"valid_loss={valid_loss:.4f} "
+                f"mae={mae:.4f} "
+                f"rmse={rmse:.4f} "
+                f"auc={auc:.4f}"
             )
+
+            if mae < best_mae:
+                best_mae = mae
+                best_state = {
+                    k: v.detach().cpu().clone()
+                    for k, v in model.state_dict().items()
+                }
+
+        model.load_state_dict(best_state)
+
+        model_path = os.path.join(args.out_dir, f"best_model_fold{fold}.pth")
+        torch.save(best_state, model_path)
+
+        valid_loss, y_true, y_pred = predict_valid(
+            model,
+            valid_loader,
+            criterion,
+            device
+        )
+
+        oof_pred[va_idx] = y_pred
+
+        fold_mae = mean_absolute_error(y_true, y_pred)
+        fold_rmse = mean_squared_error(y_true, y_pred) ** 0.5
+
+        y_true_bin = (y_true >= 0.5).astype(int)
+        try:
+            fold_auc = roc_auc_score(y_true_bin, y_pred)
         except Exception:
-            print("OOF AUC(binary ref): nan")
+            fold_auc = np.nan
 
-        return result_df
+        fold_results.append({
+            "fold": fold,
+            "n_train_real": len(real_train_df),
+            "n_train_pseudo": len(pseudo_df) if args.use_pseudo else 0,
+            "n_valid_real": len(valid_df),
+            "mae": fold_mae,
+            "rmse": fold_rmse,
+            "auc_binary_ref": fold_auc
+        })
 
-    def average_fold_weights(self):
-        paths = [
-            os.path.join(self.output_dir, f"best_model_fold{i}.pth")
-            for i in range(1, self.n_splits + 1)
-        ]
+        if args.save_cam:
+            cam_path = os.path.join(args.out_dir, f"gradcampp_fold{fold}.png")
+            make_mean_cam_figure(
+                model=model,
+                loader=valid_loader,
+                device=device,
+                out_path=cam_path,
+                prob_low=args.cam_prob_low,
+                prob_high=args.cam_prob_high,
+                alpha=args.cam_alpha
+            )
 
-        avg_state = None
+    result_df = pd.DataFrame(fold_results)
+    result_path = os.path.join(args.out_dir, "cv_results.csv")
+    result_df.to_csv(result_path, index=False)
 
-        for p in paths:
-            state = torch.load(p, map_location="cpu")
+    real_df["oof_pred_ratio"] = oof_pred
+    oof_path = os.path.join(args.out_dir, "oof_real_predictions.csv")
+    real_df.to_csv(oof_path, index=False)
 
-            if avg_state is None:
-                avg_state = OrderedDict()
-                for k, v in state.items():
-                    avg_state[k] = v.clone().float()
-            else:
-                for k, v in state.items():
-                    avg_state[k] += v.float()
+    print("\n=== Fold results ===")
+    print(result_df)
 
-        for k in avg_state:
-            avg_state[k] /= len(paths)
+    print("\n=== CV summary on real validation only ===")
+    print(result_df[["mae", "rmse", "auc_binary_ref"]].agg(["mean", "std"]))
 
-        save_path = os.path.join(self.output_dir, "best_model_fold_avg.pth")
-        torch.save(avg_state, save_path)
-        print(f"saved: {save_path}")
+    print("Saved:", result_path)
+    print("Saved:", oof_path)
 
 
-# ============================================================
-# CLI
-# ============================================================
-def parse_args():
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--mode", type=str, required=True,
-                        choices=["train", "pseudo", "train_with_pseudo"])
+    parser.add_argument("--csv_path", type=str, default="train_with_pseudo.csv")
+    parser.add_argument("--out_dir", type=str, default="./outputs")
 
-    parser.add_argument("--labeled_csv", type=str, default=None)
-    parser.add_argument("--unlabeled_csv", type=str, default=None)
-    parser.add_argument("--teacher_weight", type=str, default=None)
-
-    parser.add_argument("--output_dir", type=str, default="./outputs")
-    parser.add_argument("--model_name", type=str, default="resnet10t")
     parser.add_argument("--img_size", type=int, default=224)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=10)
@@ -532,147 +568,13 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
 
-    parser.add_argument("--low_th", type=float, default=0.10)
-    parser.add_argument("--high_th", type=float, default=0.90)
-    parser.add_argument("--pseudo_weight", type=float, default=0.3)
+    parser.add_argument("--tab_cols", type=str, default="Age,Sex")
+    parser.add_argument("--use_pseudo", action="store_true")
 
-    return parser.parse_args()
+    parser.add_argument("--save_cam", action="store_true")
+    parser.add_argument("--cam_prob_low", type=float, default=0.1)
+    parser.add_argument("--cam_prob_high", type=float, default=0.9)
+    parser.add_argument("--cam_alpha", type=float, default=0.35)
 
-
-def main():
-    args = parse_args()
-    seed_everything(args.seed)
-
-    device = get_device()
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    if args.mode == "train":
-        if args.labeled_csv is None:
-            raise ValueError("--labeled_csv is required for train mode")
-
-        df = pd.read_csv(args.labeled_csv)
-
-        cv = CrossValidator(
-            model_name=args.model_name,
-            img_size=args.img_size,
-            batch_size=args.batch_size,
-            epochs=args.epochs,
-            lr=args.lr,
-            n_splits=args.n_splits,
-            device=device,
-            output_dir=args.output_dir,
-            pseudo_weight=args.pseudo_weight,
-            num_workers=args.num_workers,
-        )
-        cv.run(df)
-
-    elif args.mode == "pseudo":
-        if args.unlabeled_csv is None:
-            raise ValueError("--unlabeled_csv is required for pseudo mode")
-        if args.teacher_weight is None:
-            raise ValueError("--teacher_weight is required for pseudo mode")
-
-        unlabeled_df = pd.read_csv(args.unlabeled_csv)
-
-        tfms = TransformFactory(args.img_size)
-        teacher = PharyngitisRegressor(
-            model_name=args.model_name,
-            pretrained=False,
-        )
-        teacher.load_state_dict(torch.load(args.teacher_weight, map_location=device))
-
-        labeler = PseudoLabeler(
-            model=teacher,
-            device=device,
-            transform=tfms.valid(),
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-        )
-
-        pseudo_all, pseudo_keep = labeler.create_pseudo_dataframe(
-            unlabeled_df,
-            low_th=args.low_th,
-            high_th=args.high_th,
-        )
-
-        pseudo_all_path = os.path.join(args.output_dir, "pseudo_all_predictions.csv")
-        pseudo_keep_path = os.path.join(args.output_dir, "pseudo_confident_used.csv")
-
-        pseudo_all.to_csv(pseudo_all_path, index=False)
-        pseudo_keep.to_csv(pseudo_keep_path, index=False)
-
-        print(f"pseudo all: {len(pseudo_all)}")
-        print(f"pseudo kept: {len(pseudo_keep)}")
-        print(f"saved: {pseudo_all_path}")
-        print(f"saved: {pseudo_keep_path}")
-
-    elif args.mode == "train_with_pseudo":
-        if args.labeled_csv is None:
-            raise ValueError("--labeled_csv is required for train_with_pseudo mode")
-        if args.unlabeled_csv is None:
-            raise ValueError("--unlabeled_csv is required for train_with_pseudo mode")
-        if args.teacher_weight is None:
-            raise ValueError("--teacher_weight is required for train_with_pseudo mode")
-
-        labeled_df = pd.read_csv(args.labeled_csv)
-        labeled_df["is_pseudo"] = 0
-
-        unlabeled_df = pd.read_csv(args.unlabeled_csv)
-
-        tfms = TransformFactory(args.img_size)
-        teacher = PharyngitisRegressor(
-            model_name=args.model_name,
-            pretrained=False,
-        )
-        teacher.load_state_dict(torch.load(args.teacher_weight, map_location=device))
-
-        labeler = PseudoLabeler(
-            model=teacher,
-            device=device,
-            transform=tfms.valid(),
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-        )
-
-        pseudo_all, pseudo_keep = labeler.create_pseudo_dataframe(
-            unlabeled_df,
-            low_th=args.low_th,
-            high_th=args.high_th,
-        )
-
-        pseudo_all.to_csv(
-            os.path.join(args.output_dir, "pseudo_all_predictions.csv"),
-            index=False,
-        )
-        pseudo_keep.to_csv(
-            os.path.join(args.output_dir, "pseudo_confident_used.csv"),
-            index=False,
-        )
-
-        train_df = pd.concat([labeled_df, pseudo_keep], axis=0).reset_index(drop=True)
-        train_df.to_csv(
-            os.path.join(args.output_dir, "train_with_pseudo.csv"),
-            index=False,
-        )
-
-        print("real labeled:", len(labeled_df))
-        print("pseudo used:", len(pseudo_keep))
-        print("combined:", len(train_df))
-
-        cv = CrossValidator(
-            model_name=args.model_name,
-            img_size=args.img_size,
-            batch_size=args.batch_size,
-            epochs=args.epochs,
-            lr=args.lr,
-            n_splits=args.n_splits,
-            device=device,
-            output_dir=args.output_dir,
-            pseudo_weight=args.pseudo_weight,
-            num_workers=args.num_workers,
-        )
-        cv.run(train_df)
-
-
-if __name__ == "__main__":
-    main()
+    args = parser.parse_args()
+    main(args)

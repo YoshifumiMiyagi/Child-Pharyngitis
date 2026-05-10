@@ -62,26 +62,13 @@ class CFG:
     # =====================
     # Fusion / Table
     # =====================
+    
     use_table: bool = False
-    table_cols: tuple = (
-       'Age','Gender', 'Feeling Cold', 'Sore Throat',
-       'Cephalalgia', 'Myalgia', 'Rhinorrhea', 'Diarrhea', 'Vomit', 'Cough',
-       'Pyrexia', 'Rigors', 'Lethargy', 'Sputum', 'Abdominal Pain', 'Vertigo',
-       'Sternutation', 'Eye Infection', 'Otalgia', 'Nasal Congestion',
-       'Asthma', 'Anorexia',
-    )
+    
+    table_cols: list = None
+    tabular_cols: list = None
+    num_cols: list = None
 
-    tabular_cols: tuple = (
-       'Age','Gender', 'Feeling Cold', 'Sore Throat',
-       'Cephalalgia', 'Myalgia', 'Rhinorrhea', 'Diarrhea', 'Vomit', 'Cough',
-       'Pyrexia', 'Rigors', 'Lethargy', 'Sputum', 'Abdominal Pain', 'Vertigo',
-       'Sternutation', 'Eye Infection', 'Otalgia', 'Nasal Congestion',
-       'Asthma', 'Anorexia',
-    )
-
-    num_cols: tuple = (
-        "Age",
-    )
     
     # =====================
     # Grad-CAM / ROI
@@ -105,7 +92,21 @@ class CFG:
                 "uvula": 120,
                 "tongue": 180,
             }
-
+        if self.table_cols is None:
+            self.table_cols = [
+                'Age','Gender', 'Feeling Cold', 'Sore Throat',
+                'Cephalalgia', 'Myalgia', 'Rhinorrhea', 'Diarrhea',
+                'Vomit', 'Cough', 'Pyrexia', 'Rigors', 'Lethargy',
+                'Sputum', 'Abdominal Pain', 'Vertigo',
+                'Sternutation', 'Eye Infection', 'Otalgia',
+                'Nasal Congestion', 'Asthma', 'Anorexia',
+            ]
+        
+        if self.tabular_cols is None:
+            self.tabular_cols = self.table_cols.copy()
+        
+        if self.num_cols is None:
+            self.num_cols = ["Age"]
 
     def get_train_transforms(self):
         import albumentations as A

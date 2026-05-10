@@ -112,17 +112,33 @@ def main():
     ).astype(int)
 
     df["stratify_label"] = df["label"]
-
-    df["image_path"] = df["sample_id"].apply(
+    possible_id_cols = [
+        "sample_id",
+        "SampleID",
+        "sample",
+        "ID",
+        "id",
+        "image_id",
+    ]
     
+    id_col = None
+    
+    for c in possible_id_cols:
+        if c in df.columns:
+            id_col = c
+            break
+    
+    print("ID COLUMN:", id_col)
+    
+    df["image_path"] = df[id_col].apply(
         lambda x:
         os.path.join(
             args.image_dir,
             str(x).zfill(3),
             f"{str(x).zfill(3)}.jpg"
         )
-    
     )
+    
     # =================================================
     # transform
     # =================================================

@@ -130,16 +130,38 @@ def main():
     
     print("ID COLUMN:", id_col)
     
+
+    def find_image_path(image_dir, pid):
+        pid = str(int(pid))
+        folder = os.path.join(image_dir, pid)
+    
+        patterns = [
+            os.path.join(folder, "*.jpg"),
+            os.path.join(folder, "*.JPG"),
+            os.path.join(folder, "*.jpeg"),
+            os.path.join(folder, "*.JPEG"),
+            os.path.join(folder, "*.png"),
+            os.path.join(folder, "*.PNG"),
+        ]
+    
+        files = []
+        for p in patterns:
+            files.extend(glob.glob(p))
+    
+        if len(files) == 0:
+            return None
+    
+        return files[0]
+    
+    
     df["image_path"] = df[id_col].apply(
-    
-        lambda x:
-        os.path.join(
-            args.image_dir,
-            str(int(x)),
-            f"{str(int(x)).zfill(3)}.jpg"
-        )
-    
+        lambda x: find_image_path(args.image_dir, x)
     )
+    
+    print("missing images:", df["image_path"].isna().sum())
+    print(df[df["image_path"].isna()][id_col].head(20))
+    
+    df = df.dropna(subset=["image_path"]).reset_index(drop=True)
     
     # =================================================
     # transform

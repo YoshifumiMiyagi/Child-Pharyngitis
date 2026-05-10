@@ -1,6 +1,6 @@
 import argparse
 import pandas as pd
-
+import os
 from config import CFG
 
 from run_image_cv import run_image_cv
@@ -22,50 +22,54 @@ def parse_args():
         default="image",
         choices=["image", "fusion", "pseudo"],
     )
-
+    
+    parser.add_argument(
+        "--dataset_dir",
+        type=str,
+        default="/kaggle/input/pharyngitis-images-metadata/PGUPharyngitis",
+    )
+    
     parser.add_argument(
         "--excel_path",
         type=str,
-        default="./data/excel.xlsx",
+        default="/kaggle/input/pharyngitis-images-metadata/PGUPharyngitis/excel.xlsx",
     )
-
+    
     parser.add_argument(
         "--image_dir",
         type=str,
-        default="./data/images",
+        default="/kaggle/input/pharyngitis-images-metadata/PGUPharyngitis/data_image_pharyngitis_nature",
     )
-
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-    )
-
+    
     parser.add_argument(
         "--epochs",
         type=int,
         default=10,
     )
-
+    
     parser.add_argument(
         "--batch_size",
         type=int,
         default=32,
     )
-
+    
     parser.add_argument(
-        "--lr",
-        type=float,
-        default=1e-4,
+        "--seed",
+        type=int,
+        default=42,
     )
-
+    
     parser.add_argument(
         "--n_splits",
         type=int,
         default=5,
     )
-
-    return parser.parse_args()
+    
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=1e-4,
+    )
 
 
 # =====================================================
@@ -83,9 +87,8 @@ def main():
     cfg.batch_size = args.batch_size
     cfg.lr = args.lr
     cfg.n_splits = args.n_splits
-
     cfg.image_dir = args.image_dir
-
+    cfg.dataset_dir = args.dataset_dir
     # =================================================
     # load data
     # =================================================
@@ -98,6 +101,16 @@ def main():
 
     df["stratify_label"] = df["label"]
 
+    df["image_path"] = df["sample_id"].apply(
+    
+        lambda x:
+        os.path.join(
+            args.image_dir,
+            str(x).zfill(3),
+            f"{str(x).zfill(3)}.jpg"
+        )
+    
+    )
     # =================================================
     # transform
     # =================================================

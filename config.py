@@ -64,10 +64,25 @@ class CFG:
     # =====================
     use_table: bool = False
     table_cols: tuple = (
-        "Age",
-        "Gender",
+       'Age','Gender', 'Feeling Cold', 'Sore Throat',
+       'Cephalalgia', 'Myalgia', 'Rhinorrhea', 'Diarrhea', 'Vomit', 'Cough',
+       'Pyrexia', 'Rigors', 'Lethargy', 'Sputum', 'Abdominal Pain', 'Vertigo',
+       'Sternutation', 'Eye Infection', 'Otalgia', 'Nasal Congestion',
+       'Asthma', 'Anorexia',
     )
 
+    tabular_cols: tuple = (
+       'Age','Gender', 'Feeling Cold', 'Sore Throat',
+       'Cephalalgia', 'Myalgia', 'Rhinorrhea', 'Diarrhea', 'Vomit', 'Cough',
+       'Pyrexia', 'Rigors', 'Lethargy', 'Sputum', 'Abdominal Pain', 'Vertigo',
+       'Sternutation', 'Eye Infection', 'Otalgia', 'Nasal Congestion',
+       'Asthma', 'Anorexia',
+    )
+
+    num_cols: tuple = (
+        "Age",
+    )
+    
     # =====================
     # Grad-CAM / ROI
     # =====================
@@ -86,7 +101,30 @@ class CFG:
         if self.roi_labels is None:
             self.roi_labels = {
                 "soft_palate": 60,
-                "posterior_wall": 120,
-                "uvula": 180,
-                "tongue": 240,
+                "posterior_wall": 240,
+                "uvula": 120,
+                "tongue": 180,
             }
+
+
+    def get_train_transforms(self):
+        import albumentations as A
+        from albumentations.pytorch import ToTensorV2
+
+        return A.Compose([
+            A.Resize(self.img_size, self.img_size),
+            A.HorizontalFlip(p=0.5),
+            A.Rotate(limit=10, p=0.5),
+            A.Normalize(),
+            ToTensorV2(),
+        ])
+
+    def get_valid_transforms(self):
+        import albumentations as A
+        from albumentations.pytorch import ToTensorV2
+
+        return A.Compose([
+            A.Resize(self.img_size, self.img_size),
+            A.Normalize(),
+            ToTensorV2(),
+        ])

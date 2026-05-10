@@ -96,7 +96,15 @@ def main():
     df = pd.read_excel(args.excel_path)
     
     diagnosis_cols = [c for c in df.columns if "Diagnosis" in c]
+    diag = df[diagnosis_cols].replace({
+        "Bacterial": 1,
+        "Non Bacterial": 0,
+      })
     
+    diag = diag.apply(pd.to_numeric, errors="coerce")
+    
+    df["bacterial_ratio"] = diag.mean(axis=1)
+    df["label"] = (df["bacterial_ratio"] >= 0.5).astype(int)
     if "bacterial_ratio" not in df.columns:
         df["bacterial_ratio"] = df[diagnosis_cols].mean(axis=1)
     df["label"] = (

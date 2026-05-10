@@ -131,12 +131,14 @@ def main():
     print("ID COLUMN:", id_col)
     
     df["image_path"] = df[id_col].apply(
+    
         lambda x:
         os.path.join(
             args.image_dir,
-            str(x).zfill(3),
-            f"{str(x).zfill(3)}.jpg"
+            str(int(x)),
+            f"{str(int(x)).zfill(3)}.jpg"
         )
+    
     )
     
     # =================================================

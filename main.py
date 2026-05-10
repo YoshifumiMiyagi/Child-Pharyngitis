@@ -116,7 +116,7 @@ def main():
         "sample_id",
         "SampleID",
         "sample",
-        "ID",
+        "patient_ID",
         "id",
         "image_id",
     ]
